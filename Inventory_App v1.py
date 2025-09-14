@@ -1,28 +1,25 @@
-import streamlit as st
-import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
+import streamlit as st
+import json
 
-# ----------------------------
-# Google Sheets Setup
-# ----------------------------
+# Load credentials from Streamlit secrets
+creds_dict = st.secrets["gcp_service_account"]
 scope = ["https://spreadsheets.google.com/feeds",
          "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
 def load_sheet(tab_name):
-    """Load a tab as a DataFrame"""
     sheet = client.open("BusinessData").worksheet(tab_name)
     data = sheet.get_all_records()
     return pd.DataFrame(data)
 
 def save_sheet(tab_name, df):
-    """Save a DataFrame to a Google Sheet tab"""
     sheet = client.open("BusinessData").worksheet(tab_name)
     sheet.clear()
     sheet.update([df.columns.values.tolist()] + df.values.tolist())
-
 # ----------------------------
 # Load all tabs
 # ----------------------------

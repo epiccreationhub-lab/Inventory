@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 import json
 
+
 # Load credentials from Streamlit secrets
 creds_dict = st.secrets["gcp_service_account"]
 scope = ["https://spreadsheets.google.com/feeds",
@@ -11,6 +12,7 @@ scope = ["https://spreadsheets.google.com/feeds",
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
+@st.cache_data(ttl=300)  # cache for 5 minutes
 def load_sheet(tab_name):
     sheet = client.open("BusinessData").worksheet(tab_name)
     data = sheet.get_all_records()

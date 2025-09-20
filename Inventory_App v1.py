@@ -1,70 +1,49 @@
-# inventory_app_google_sheets.py
+# inventory_app.py
 """
-Inventory & Kits Manager (Google Sheets backed)
+Inventory & Kits Manager (Google Sheets backed, batched reads + retries)
 
-Requirements:
-- streamlit
-- pandas
-- gspread
-- oauth2client
-
-Place your service account JSON under Streamlit secrets:
+Place your service account JSON in Streamlit secrets:
 st.secrets["gcp_service_account"] = { ... }
 
 Spreadsheet: BusinessData
-Expected tabs (worksheet names):
-- purchases
-- master
-- kits_bom
-- created_kits
-- sold_kits
-- defective
-- restock
-
-This file replaces local CSVs entirely: all reads/writes go to Google Sheets.
+Expected tabs (worksheets): purchases, master, kits_bom, created_kits, sold_kits, defective, restock
 """
+import time
+import random
+from datetime import datetime, date
+from typing import List, Tuple, Optional, Dict
+
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
-from typing import List, Tuple, Optional
 
-# ---------- Google Sheets / Drive setup (from user's snippet) ----------
+# Google Sheets / OAuth
 try:
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
 except Exception as e:
-    st.error("gspread and oauth2client are required. Install them in the app environment.")
+    st.error("Missing dependencies: install gspread and oauth2client in the environment.")
     raise
 
-if "gcp_service_account" not in st.secrets:
-    st.error("Missing `gcp_service_account` in Streamlit secrets. Add your service account JSON under this key.")
-    st.stop()
+st.set_page_config(page_title="Inventory & Kits Manager", page_icon="📦", layout="wide")
 
-creds_dict = st.secrets["gcp_service_account"]
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
-]
-try:
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    gclient = gspread.authorize(creds)
-except Exception as exc:
-    st.error(f"Failed to authorize with Google Sheets: {exc}")
-    raise
-
+# ---------- Config ----------
 SPREADSHEET_NAME = "BusinessData"
+CACHE_TTL = int(st.secrets.get("gsheet_cache_ttl", 300))  # seconds, default 300
+_MAX_RETRIES = 5
+_BACKOFF_BASE = 1.0  # seconds
+_READ_RANGE_SUFFIX = "A:Z"  # Range to fetch per sheet; adjust if more columns required
 
-# ---------- Expected sheet/tab names & templates ----------
-SHEET_TABS = {
-    "purchases": "purchases",
-    "master": "master",
-    "kits_bom": "kits_bom",
-    "created_kits": "created_kits",
-    "sold_kits": "sold_kits",
-    "defective": "defective",
-    "restock": "restock",
-}
+EXPECTED_TABS = [
+    "purchases",
+    "master",
+    "kits_bom",
+    "created_kits",
+    "sold_kits",
+    "defective",
+    "restock",
+]
 
+# ---------- Defaults / Templates ----------
 DEFAULTS = {
     "purchases": pd.DataFrame(columns=[
         "Date", "Material ID", "Material Name", "Vendor", "Packs", "Qty Per Pack",
@@ -86,83 +65,26 @@ DEFAULTS = {
     "restock": pd.DataFrame(columns=["Material ID", "Desired Level", "Notes"]),
 }
 
-# ---------- Google Sheets helpers ----------
-@st.cache_data(show_spinner=False)
-def gsheet_load(tab_name: str) -> pd.DataFrame:
-    """
-    Load a sheet (worksheet) into a DataFrame.
-    Cached via Streamlit for short-term speed. Clear cache after any write.
-    """
-    try:
-        sh = gclient.open(SPREADSHEET_NAME)
-        ws = sh.worksheet(tab_name)
-        data = ws.get_all_records()
-        df = pd.DataFrame(data)
-        if df.empty:
-            return DEFAULTS.get(tab_name, pd.DataFrame()).copy()
-        # If columns are unordered but match the default set, reorder them
-        expected = list(DEFAULTS.get(tab_name, pd.DataFrame()).columns)
-        if expected and set(df.columns) == set(expected):
-            df = df[expected]
-        return df
-    except gspread.SpreadsheetNotFound:
-        st.error(f"Spreadsheet '{SPREADSHEET_NAME}' not found. Create it and add tabs: {list(SHEET_TABS.values())}")
-        raise
-    except gspread.WorksheetNotFound:
-        # Return header-only default if worksheet doesn't exist
-        st.warning(f"Worksheet '{tab_name}' not found in spreadsheet. Returning empty template.")
-        return DEFAULTS.get(tab_name, pd.DataFrame()).copy()
-    except Exception as exc:
-        st.warning(f"Error loading sheet '{tab_name}': {exc}")
-        return DEFAULTS.get(tab_name, pd.DataFrame()).copy()
+# ---------- Authorize with Google Sheets ----------
+if "gcp_service_account" not in st.secrets:
+    st.error("Missing `gcp_service_account` in Streamlit secrets — add your service account JSON there.")
+    st.stop()
 
-def gsheet_save(tab_name: str, df: pd.DataFrame):
-    """
-    Save the DataFrame to the specified worksheet, overwriting it.
-    Then clear the cache for gsheet_load so subsequent reads are fresh.
-    """
-    try:
-        sh = gclient.open(SPREADSHEET_NAME)
-        # if worksheet not found, create it (gspread requires unique title)
-        try:
-            ws = sh.worksheet(tab_name)
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=tab_name, rows="1000", cols="20")
-        # Prepare rows: header + data
-        cols = df.columns.tolist()
-        rows = df.fillna("").values.tolist()
-        ws.clear()
-        ws.update([cols] + rows)
-    except Exception as exc:
-        st.warning(f"Failed to save sheet '{tab_name}': {exc}")
-        raise
-    finally:
-        # Clear cached loads so next load is fresh
-        try:
-            gsheet_load.clear()
-        except Exception:
-            pass
+creds_dict = st.secrets["gcp_service_account"]
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
+try:
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    gclient = gspread.authorize(creds)
+except Exception as exc:
+    st.error(f"Failed to authorize Google Sheets: {exc}")
+    raise
 
-# ---------- Convenience IO wrappers (use tab keys) ----------
-def load_df(kind: str) -> pd.DataFrame:
-    if kind not in SHEET_TABS:
-        raise ValueError(f"Unknown dataset kind: {kind}")
-    return gsheet_load(SHEET_TABS[kind])
-
-def save_df(df: pd.DataFrame, kind: str):
-    if kind not in SHEET_TABS:
-        raise ValueError(f"Unknown dataset kind: {kind}")
-    # If DataFrame columns are a reorder of expected, force reorder
-    expected = list(DEFAULTS.get(kind).columns)
-    if expected and set(df.columns) == set(expected):
-        df = df[expected]
-    gsheet_save(SHEET_TABS[kind], df)
-
-# ---------- Utility helpers & domain logic improvements ----------
-def ensure_numeric(df: pd.DataFrame, cols: List[str]):
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+# ---------- Helper utilities ----------
+def _sheet_range(tab_name: str) -> str:
+    return f"{tab_name}!{_READ_RANGE_SUFFIX}"
 
 def _safe_float(val) -> float:
     try:
@@ -172,62 +94,164 @@ def _safe_float(val) -> float:
     except Exception:
         return 0.0
 
+def ensure_numeric(df: pd.DataFrame, cols: List[str]):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+# ---------- Batched loader with retries & caching ----------
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def gsheet_load_all(tabs: List[str]) -> Dict[str, pd.DataFrame]:
+    """
+    Batch-load multiple worksheets using one values_batch_get call.
+    Returns a dict: tab_name -> DataFrame
+    Cached for CACHE_TTL seconds.
+    """
+    sh = gclient.open(SPREADSHEET_NAME)
+    ranges = [_sheet_range(t) for t in tabs]
+
+    # Attempt batched call with retries
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            result = sh.values_batch_get(ranges)
+            outputs: Dict[str, pd.DataFrame] = {}
+            value_ranges = result.get("valueRanges", [])
+            for idx, vr in enumerate(value_ranges):
+                tab = tabs[idx]
+                values = vr.get("values", []) or []
+                if not values:
+                    outputs[tab] = DEFAULTS.get(tab, pd.DataFrame()).copy()
+                    continue
+                header = values[0]
+                rows = values[1:]
+                # Build dataframe; if rows length mismatches, pad/truncate automatically handled by pandas
+                df = pd.DataFrame(rows, columns=header)
+                # If expected header set matches, reorder to canonical order
+                expected = list(DEFAULTS.get(tab, pd.DataFrame()).columns)
+                if expected and set(df.columns) == set(expected):
+                    df = df[expected]
+                outputs[tab] = df
+            return outputs
+        except Exception as exc:
+            estr = str(exc)
+            # detect rate-limit / quota-like errors heuristically
+            if "429" in estr or "Quota" in estr or "rateLimitExceeded" in estr or "userRateLimitExceeded" in estr:
+                wait = _BACKOFF_BASE * (2 ** (attempt - 1))
+                # small jitter to spread retries
+                wait = wait + random.uniform(0, 0.2 * attempt)
+                st.warning(f"Sheets API rate-limited (attempt {attempt}/{_MAX_RETRIES}). Retrying in {wait:.1f}s...")
+                time.sleep(wait)
+                continue
+            # other errors: break to fallback
+            st.warning(f"Batch load failed: {exc}. Falling back to individual sheet loads.")
+            break
+
+    # Fallback: load per sheet with retries
+    outputs = {}
+    for tab in tabs:
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                ws = sh.worksheet(tab)
+                data = ws.get_all_records()
+                df = pd.DataFrame(data)
+                if df.empty:
+                    outputs[tab] = DEFAULTS.get(tab, pd.DataFrame()).copy()
+                else:
+                    expected = list(DEFAULTS.get(tab, pd.DataFrame()).columns)
+                    if expected and set(df.columns) == set(expected):
+                        df = df[expected]
+                    outputs[tab] = df
+                break
+            except Exception as exc:
+                estr = str(exc)
+                if "429" in estr or "Quota" in estr or "rateLimitExceeded" in estr or "userRateLimitExceeded" in estr:
+                    wait = _BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.1 * attempt)
+                    st.warning(f"Sheet {tab} read rate-limited (attempt {attempt}). Retrying in {wait:.1f}s...")
+                    time.sleep(wait)
+                    continue
+                st.warning(f"Failed to load sheet {tab}: {exc}. Using empty template.")
+                outputs[tab] = DEFAULTS.get(tab, pd.DataFrame()).copy()
+                break
+    return outputs
+
+# ---------- Save helper (per sheet) and clear batch cache ----------
+def gsheet_save_single(tab_name: str, df: pd.DataFrame):
+    """
+    Overwrite one worksheet with the dataframe contents.
+    Clears the cached batch loader afterwards.
+    """
+    sh = gclient.open(SPREADSHEET_NAME)
+    try:
+        try:
+            ws = sh.worksheet(tab_name)
+        except gspread.WorksheetNotFound:
+            # Create worksheet with reasonable size
+            ws = sh.add_worksheet(title=tab_name, rows="1000", cols="30")
+        cols = df.columns.tolist()
+        rows = df.fillna("").values.tolist()
+        ws.clear()
+        # Use update to write header + rows
+        ws.update([cols] + rows)
+    except Exception as exc:
+        st.warning(f"Failed to save sheet '{tab_name}': {exc}")
+        raise
+    finally:
+        # Clear the batch cache so subsequent reads see the latest data
+        try:
+            gsheet_load_all.clear()
+        except Exception:
+            pass
+
+# ---------- IO wrappers using tab keys ----------
+def load_df(kind: str) -> pd.DataFrame:
+    if kind not in EXPECTED_TABS:
+        raise ValueError(f"Unknown kind: {kind}")
+    loaded = gsheet_load_all(EXPECTED_TABS)
+    return loaded.get(kind, DEFAULTS.get(kind).copy())
+
+def save_df(df: pd.DataFrame, kind: str):
+    if kind not in EXPECTED_TABS:
+        raise ValueError(f"Unknown kind: {kind}")
+    # reorder to canonical columns if matches
+    expected = list(DEFAULTS.get(kind).columns)
+    if expected and set(df.columns) == set(expected):
+        df = df[expected]
+    gsheet_save_single(kind, df)
+
+# ---------- Domain logic (robust) ----------
 def build_material_events(purchases: pd.DataFrame,
                           created_kits: pd.DataFrame,
                           defective: pd.DataFrame,
                           bom: pd.DataFrame) -> dict:
-    """
-    Build chronological events per material:
-    - purchases: positive delta with price_per_piece
-    - created_kits: negative delta (consumption)
-    - defective: negative delta (consumption)
-    Returns: {material_id: [events_sorted_by_date]}
-    """
     events_by_mat = {}
-
     # purchases
     if purchases is not None and not purchases.empty:
         for r in purchases.to_dict(orient="records"):
-            # parse date robustly
             try:
                 d = pd.to_datetime(r.get("Date"), errors="coerce")
             except Exception:
                 d = pd.to_datetime(datetime.today())
             mid = str(r.get("Material ID") or "")
-            # accept Pieces or compute from Packs * Qty Per Pack if Pieces missing
             pieces = _safe_float(r.get("Pieces") or r.get("pieces") or 0)
             if pieces == 0:
                 packs = _safe_float(r.get("Packs") or 0)
                 qty_per_pack = _safe_float(r.get("Qty Per Pack") or 0)
                 pieces = packs * qty_per_pack
-            # robust price detection across multiple column names
+            # price candidates
             price_candidates = [
-                r.get("Price Per Piece"),
-                r.get("Price per Piece"),
-                r.get("PricePerPiece"),
-                r.get("Price_Per_Piece"),
-                r.get("Price"),
-                r.get("Cost Per Pack")
+                r.get("Price Per Piece"), r.get("Price per Piece"),
+                r.get("PricePerPiece"), r.get("Price_Per_Piece"),
+                r.get("Price"), r.get("Cost Per Pack")
             ]
-            # If cost per pack provided and qty_per_pack > 0, compute per-piece
             ppp = next((x for x in price_candidates if x not in (None, "") and pd.notna(x)), None)
             ppp = _safe_float(ppp)
             if ppp == 0 and _safe_float(r.get("Cost Per Pack") or 0) > 0 and _safe_float(r.get("Qty Per Pack") or 0) > 0:
                 ppp = _safe_float(r.get("Cost Per Pack")) / _safe_float(r.get("Qty Per Pack"))
-
-            ev = {
-                "date": d,
-                "delta": pieces,
-                "price_per_piece": ppp,
-                "type": "purchase",
-                "vendor": r.get("Vendor", ""),
-                "name": r.get("Material Name", "")
-            }
+            ev = {"date": d, "delta": pieces, "price_per_piece": ppp, "type": "purchase",
+                  "vendor": r.get("Vendor", ""), "name": r.get("Material Name", "")}
             events_by_mat.setdefault(mid, []).append(ev)
-
-    # created_kits -> expand via BOM to material-level consumption
+    # created kits -> expand using bom
     if bom is not None and not bom.empty and created_kits is not None and not created_kits.empty:
-        # build map kit_id -> list of bom rows (dicts)
         bom_map = {}
         for br in bom.to_dict(orient="records"):
             k = str(br.get("Kit ID") or "")
@@ -244,17 +268,10 @@ def build_material_events(purchases: pd.DataFrame,
                     mid = str(br.get("Material ID") or "")
                     qty_per_kit = _safe_float(br.get("Qty Per Kit") or 0)
                     total_consume = qty_per_kit * qty_kits
-                    ev = {
-                        "date": d,
-                        "delta": -total_consume,
-                        "price_per_piece": None,
-                        "type": "consume",
-                        "kit_id": kit_id,
-                        "kit_name": cr.get("Kit Name", "")
-                    }
+                    ev = {"date": d, "delta": -total_consume, "price_per_piece": None,
+                          "type": "consume", "kit_id": kit_id, "kit_name": cr.get("Kit Name", "")}
                     events_by_mat.setdefault(mid, []).append(ev)
-
-    # defective -> consumption
+    # defective
     if defective is not None and not defective.empty:
         for dr in defective.to_dict(orient="records"):
             try:
@@ -265,23 +282,17 @@ def build_material_events(purchases: pd.DataFrame,
             qty = _safe_float(dr.get("Qty") or 0)
             ev = {"date": d, "delta": -qty, "price_per_piece": None, "type": "defect", "reason": dr.get("Reason", "")}
             events_by_mat.setdefault(mid, []).append(ev)
-
-    # sort events chronologically per material
+    # sort
     for mid, evs in events_by_mat.items():
         evs_sorted = sorted(evs, key=lambda x: pd.to_datetime(x.get("date")))
         events_by_mat[mid] = evs_sorted
-
     return events_by_mat
 
 def compute_snapshot_from_events(events_by_mat: dict) -> pd.DataFrame:
-    """
-    Process each material events using weighted-average (moving average) cost method.
-    Returns master snapshot DF.
-    """
     rows = []
     for mid, events in events_by_mat.items():
         total_pieces = 0.0
-        total_cost = 0.0  # cost tied to current on-hand pieces
+        total_cost = 0.0
         total_purchased = 0.0
         total_consumed = 0.0
         name = ""
@@ -298,16 +309,13 @@ def compute_snapshot_from_events(events_by_mat: dict) -> pd.DataFrame:
                 if ev.get("vendor"):
                     vendor = ev.get("vendor")
             else:
-                # consumption
                 consume_pieces = -_safe_float(ev.get("delta") or 0)
                 if total_pieces > 0:
                     avg_cost = (total_cost / total_pieces) if total_pieces != 0 else 0.0
-                    # remove cost proportionally to pieces consumed (up to available)
                     remove_cost = min(consume_pieces, total_pieces) * avg_cost
                     total_cost -= remove_cost
                     total_pieces -= min(consume_pieces, total_pieces)
                 else:
-                    # negative stock scenario; cost remains zero
                     total_pieces -= consume_pieces
                 total_consumed += consume_pieces
         available_pieces = round(total_pieces, 6)
@@ -330,22 +338,17 @@ def compute_snapshot_from_events(events_by_mat: dict) -> pd.DataFrame:
     return df
 
 def recompute_master_snapshot() -> pd.DataFrame:
-    """
-    Clears the read cache, loads ledger sheets, computes snapshot, and writes it back to 'master' sheet.
-    """
-    # Clear load cache so that reload sees latest writes
+    # Clear batch cache
     try:
-        gsheet_load.clear()
+        gsheet_load_all.clear()
     except Exception:
         pass
-
     purchases = load_df("purchases")
     created = load_df("created_kits")
     defective = load_df("defective")
     bom = load_df("kits_bom")
     events = build_material_events(purchases, created, defective, bom)
     snapshot = compute_snapshot_from_events(events)
-    # Save the master snapshot back to sheet
     save_df(snapshot, "master")
     return snapshot
 
@@ -389,32 +392,28 @@ def kit_cost_from_snapshot(snapshot: pd.DataFrame, bom: pd.DataFrame, kit_id: st
         total += qty * unit
     return round(total, 2)
 
-# ---------- Load initial data from Google Sheets ----------
-purchases_df = load_df("purchases")
-bom_df = load_df("kits_bom")
-created_df = load_df("created_kits")
-sold_df = load_df("sold_kits")
-defective_df = load_df("defective")
-restock_df = load_df("restock")
+# ---------- Load initial data ----------
+loaded = gsheet_load_all(EXPECTED_TABS)
+purchases_df = loaded.get("purchases", DEFAULTS["purchases"].copy())
+bom_df = loaded.get("kits_bom", DEFAULTS["kits_bom"].copy())
+created_df = loaded.get("created_kits", DEFAULTS["created_kits"].copy())
+sold_df = loaded.get("sold_kits", DEFAULTS["sold_kits"].copy())
+defective_df = loaded.get("defective", DEFAULTS["defective"].copy())
+restock_df = loaded.get("restock", DEFAULTS["restock"].copy())
 
-# compute snapshot (master) from ledger
 master_snapshot = recompute_master_snapshot()
 
-# ensure numeric columns in sold_df and ensure Qty exists
 ensure_numeric(sold_df, ["Price", "Fees", "Amount Received", "Cost Price", "Profit", "Qty"])
 if "Qty" not in sold_df.columns:
     sold_df["Qty"] = 0
 
-# ---------- Streamlit UI (same structure, now using Google Sheets) ----------
-st.set_page_config(page_title="Inventory & Kits Manager", page_icon="📦", layout="wide")
-
+# ---------- UI (keeps same layout) ----------
 MAIN_SECTIONS = ["📊 Dashboards", "📦 Inventory Management", "🧩 Kits Management", "🧾 Sales", "⬇️ Data"]
 main_section = st.sidebar.selectbox("Section", MAIN_SECTIONS)
 
-# ---------- Dashboards ----------
+# -- Dashboards --
 if main_section == "📊 Dashboards":
     dash_choice = st.sidebar.radio("Choose Dashboard", ["📦 Inventory Dashboard", "💰 Sales Dashboard"])
-
     if dash_choice == "📦 Inventory Dashboard":
         st.title("📦 Inventory Dashboard")
         total_materials = len(master_snapshot)
@@ -508,13 +507,11 @@ elif main_section == "📦 Inventory Management":
 
     if sub == "Master Inventory (Purchases)":
         st.subheader("Add Purchase (new or existing material)")
-        # dropdown for existing materials
         existing_ids = sorted(pd.unique(list(purchases_df.get("Material ID", pd.Series(dtype=str)).astype(str).tolist() + master_snapshot.get("ID", pd.Series(dtype=str)).astype(str).tolist())))
         mat_options = [""] + existing_ids
         mat_options = list(dict.fromkeys(mat_options))
         selected = st.selectbox("Select existing Material ID (leave blank to add new)", mat_options)
 
-        # prefill values if selected
         if selected:
             prev = purchases_df[purchases_df["Material ID"] == selected] if "Material ID" in purchases_df.columns else pd.DataFrame()
             if not prev.empty:
@@ -778,7 +775,6 @@ elif main_section == "🧾 Sales":
                 }
                 sold_df = pd.concat([sold_df, pd.DataFrame([row])], ignore_index=True)
                 save_df(sold_df, "sold_kits")
-                # sales do not alter inventory - inventory changes when kits are produced
                 st.success(f"Recorded sale. Profit: ₹{profit:,.2f}")
 
         st.subheader("Recent Sales")
@@ -788,12 +784,11 @@ elif main_section == "🧾 Sales":
         st.subheader("Sales Ledger")
         st.dataframe(sold_df)
 
-# ---------- Data (templates / export / import) ----------
+# ---------- Data (export / import) ----------
 elif main_section == "⬇️ Data":
     st.title("⬇️ Import / ⬆️ Export Data & Templates")
     st.markdown("Download current datasets or download header-only templates. Upload CSV to replace a worksheet (must match template columns).")
 
-    # Exports: download CSV for each sheet
     e1, e2, e3 = st.columns(3)
     with e1:
         st.download_button("Download purchases.csv", purchases_df.to_csv(index=False).encode("utf-8"), "purchases.csv")
@@ -834,25 +829,22 @@ elif main_section == "⬇️ Data":
         try:
             new_df = pd.read_csv(up)
             expected = list(DEFAULTS[which_map[which_choice]].columns)
-            # accept same columns in any order
             if set(new_df.columns) != set(expected):
                 st.error(f"Invalid columns. Expected headers (order not important): {expected}")
             else:
-                # reorder to expected order before saving
-                new_df = new_df[expected]
+                new_df = new_df[expected]  # reorder
                 save_df(new_df, which_map[which_choice])
-                # If we changed purchases/created/defective/kits_bom, recompute master snapshot
                 if which_choice in ("purchases", "created_kits", "defective", "kits_bom"):
                     master_snapshot = recompute_master_snapshot()
                 st.success(f"Replaced worksheet {which_choice} with uploaded CSV ({len(new_df)} rows).")
         except Exception as e:
             st.error(f"Failed to import: {e}")
 
-# ---------- Footer / refresh ----------
+# ---------- Footer ----------
 st.sidebar.markdown("---")
 if st.sidebar.button("Refresh data (clear cache)"):
     try:
-        gsheet_load.clear()
+        gsheet_load_all.clear()
     except Exception:
         pass
     st.experimental_rerun()
